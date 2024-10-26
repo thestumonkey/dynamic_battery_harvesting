@@ -90,9 +90,8 @@ action:
               discharge_duration: "{{ (target_export * 1000) / discharge_power * 3600 }}"  # Duration to reach target export in seconds
               discharge_start_time: "{{ start_time - discharge_duration }}"
 
-          # Delay until discharge_start_time
-          - delay:
-              until: "{{ now().timestamp() >= discharge_start_time }}"
+          # Wait until discharge_start_time
+          - wait_template: "{{ now().timestamp() >= discharge_start_time }}"
 
           # Only discharge if there is excess energy in the battery
           - condition: template
