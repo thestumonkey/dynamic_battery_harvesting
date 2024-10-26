@@ -117,11 +117,4 @@ action:
             target:
               entity_id: !input charge_switch
 
-      default:
-        # Ensure discharge and charge switches are off if no dispatch is planned
-        - service: switch.turn_off
-          target:
-            entity_id: !input discharge_switch
-        - service: switch.turn_off
-          target:
-            entity_id: !input charge_switch
+      default: []
