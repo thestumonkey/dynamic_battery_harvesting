@@ -1,0 +1,103 @@
+blueprint:
+  name: Optimal Battery Discharge for Off-Peak Slots
+  description: Discharge battery before off-peak slots to optimize charging costs with Home Assistant.
+  domain: automation
+  input:
+    battery_charge_sensor:
+      name: Battery Charge Sensor
+      description: Sensor showing the battery's current charge as a percentage.
+      selector:
+        entity:
+          domain: sensor
+
+    energy_flow_sensor:
+      name: Household Energy Consumption Sensor
+      description: Sensor for household energy consumption (negative if solar is contributing).
+      selector:
+        entity:
+          domain: sensor
+
+    offpeak_binary_sensor:
+      name: Off-Peak Schedule Sensor
+      description: Binary sensor for off-peak slots (turns on when off-peak is active).
+      selector:
+        entity:
+          domain: binary_sensor
+
+    inverter_capacity:
+      name: Inverter Capacity (kW)
+      description: Maximum inverter output capacity in kilowatts (e.g., 3.8).
+      default: 3.8
+
+    battery_capacity:
+      name: Battery Capacity (kWh)
+      description: Total battery capacity in kilowatt-hours (e.g., 15).
+      default: 15
+
+    discharge_offset:
+      name: Discharge Start Offset (seconds)
+      description: Time before off-peak slot to start discharging (in seconds).
+      default: 300
+      selector:
+        number:
+          min: 0
+          max: 3600
+          unit_of_measurement: seconds
+
+    discharge_power:
+      name: Discharge Power (W)
+      description: Power at which the battery should discharge (e.g., 3800W).
+      default: 3800
+
+trigger:
+  - platform: time_pattern
+    minutes: "/10"  # Check every 10 minutes for updated off-peak schedule
+
+  - platform: homeassistant
+    event: start  # Check on Home Assistant start to re-initialize schedule
+
+variables:
+  battery_capacity: !input battery_capacity
+  inverter_capacity: !input inverter_capacity
+  discharge_offset: !input discharge_offset
+  discharge_power: !input discharge_power
+
+action:
+  - variables:
+      current_charge: "{{ states( (input.battery_charge_sensor | string) ) | float / 100 * battery_capacity }}"
+      household_consumption: "{{ states( (input.energy_flow_sensor | string) ) | float }}"
+      planned_dispatches: "{{ state_attr((input.offpeak_binary_sensor | string), 'planned_dispatches') }}"
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ planned_dispatches | length > 0 }}"  # Ensure dispatches are available
+        sequence:
+          - variables:
+              next_slot: "{{ planned_dispatches | first }}"
+              start_time: "{{ as_timestamp(next_slot.start) }}"
+              end_time: "{{ as_timestamp(next_slot.end) }}"
+              duration_hours: "{{ (end_time - start_time) / 3600 }}"
+              # Calculate net importable energy for this slot
+              net_importable_energy: "{{ duration_hours * (inverter_capacity - household_consumption) }}"
+              # Calculate how much to discharge for this slot
+              target_export: "{{ current_charge + net_importable_energy - battery_capacity }}"
+              export_target_charge: "{{ ((current_charge - target_export) / battery_capacity) * 100 }}"  # Target battery charge percentage
+
+          # Set up a delay to start discharging just before the slot
+          - delay:
+              seconds: "{{ start_time - now().timestamp() - discharge_offset | int }}"
+
+          # Only discharge if there is excess energy in the battery
+          - condition: template
+            value_template: "{{ target_export > 0 }}"
+
+          # Start discharging
+          - service: inverter.start_exporting
+            data:
+              power: "{{ discharge_power }}"
+
+          # Stop discharging when target battery level is reached or slot ends
+          - wait_template: "{{ states('sensor.battery_charge') | float <= export_target_charge or as_timestamp(now()) >= end_time }}"
+          - service: inverter.stop_exporting
+default: []
