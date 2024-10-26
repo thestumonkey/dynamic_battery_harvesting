@@ -1,0 +1,118 @@
+blueprint:
+  name: Optimal Battery Discharge for Off-Peak Slots (Dynamic Start with Grid Control)
+  description: Discharge battery dynamically before off-peak slots based on calculated discharge time, with control for grid charging and discharging.
+  domain: automation
+  input:
+    battery_charge_sensor:
+      name: Battery Charge Sensor
+      description: Sensor showing the battery's current charge as a percentage.
+      selector:
+        entity:
+          domain: sensor
+
+    energy_flow_sensor:
+      name: Household Energy Consumption Sensor
+      description: Sensor for household energy consumption (negative if solar is contributing).
+      selector:
+        entity:
+          domain: sensor
+
+    offpeak_binary_sensor:
+      name: Off-Peak Schedule Sensor
+      description: Binary sensor for off-peak slots (turns on when off-peak is active).
+      selector:
+        entity:
+          domain: binary_sensor
+
+    charge_switch:
+      name: Charge from Grid Switch
+      description: Switch to enable charging from the grid.
+      selector:
+        entity:
+          domain: switch
+
+    discharge_switch:
+      name: Discharge to Grid Switch
+      description: Switch to enable discharging to the grid.
+      selector:
+        entity:
+          domain: switch
+
+    inverter_capacity:
+      name: Inverter Capacity (kW)
+      description: Maximum inverter output capacity in kilowatts (e.g., 3.8).
+      default: 3.8
+
+    battery_capacity:
+      name: Battery Capacity (kWh)
+      description: Total battery capacity in kilowatt-hours (e.g., 15).
+      default: 15
+
+    discharge_power:
+      name: Discharge Power (W)
+      description: Power at which the battery should discharge (e.g., 3800W).
+      default: 3800
+
+trigger:
+  - platform: time_pattern
+    minutes: "/10"  # Check every 10 minutes for updated off-peak schedule
+
+  - platform: homeassistant
+    event: start  # Check on Home Assistant start to re-initialize schedule
+
+variables:
+  battery_capacity: !input battery_capacity
+  inverter_capacity: !input inverter_capacity
+  discharge_power: !input discharge_power
+
+action:
+  - variables:
+      current_charge: "{{ states( (input.battery_charge_sensor | string) ) | float / 100 * battery_capacity }}"
+      household_consumption: "{{ states( (input.energy_flow_sensor | string) ) | float }}"
+      planned_dispatches: "{{ state_attr((input.offpeak_binary_sensor | string), 'planned_dispatches') }}"
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ planned_dispatches | length > 0 }}"  # Ensure dispatches are available
+        sequence:
+          - variables:
+              next_slot: "{{ planned_dispatches | first }}"
+              start_time: "{{ as_timestamp(next_slot.start) }}"
+              end_time: "{{ as_timestamp(next_slot.end) }}"
+              duration_hours: "{{ (end_time - start_time) / 3600 }}"
+              # Calculate net importable energy for this slot
+              net_importable_energy: "{{ duration_hours * (inverter_capacity - household_consumption) }}"
+              # Calculate how much to discharge for this slot
+              target_export: "{{ current_charge + net_importable_energy - battery_capacity }}"
+              export_target_charge: "{{ ((current_charge - target_export) / battery_capacity) * 100 }}"  # Target battery charge percentage
+              # Calculate discharge duration in seconds
+              discharge_duration: "{{ (target_export * 1000) / discharge_power * 3600 }}"  # Duration to reach target export in seconds
+              discharge_start_time: "{{ start_time - discharge_duration }}"
+
+          # Delay until discharge_start_time
+          - delay:
+              until: "{{ now().timestamp() >= discharge_start_time }}"
+
+          # Only discharge if there is excess energy in the battery
+          - condition: template
+            value_template: "{{ target_export > 0 }}"
+
+          # Start discharging
+          - service: switch.turn_on
+            target:
+              entity_id: !input discharge_switch
+
+          # Stop discharging when target battery level is reached or slot ends
+          - wait_template: "{{ states('sensor.battery_charge') | float <= export_target_charge or as_timestamp(now()) >= end_time }}"
+          - service: switch.turn_off
+            target:
+              entity_id: !input discharge_switch
+
+          # Start charging if required when in off-peak slot
+          - condition: state
+            entity_id: !input offpeak_binary_sensor
+            state: "on"
+          - service: switch.turn_on
+            target:
+              entity_id: !input charge_switch
